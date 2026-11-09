@@ -12,22 +12,21 @@ import kotlinx.coroutines.tasks.await
 object Scanner {
     private val rec by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
-    suspend fun ingest(ctx: Context, dao: ItemDao, uri: Uri, source: String): Boolean = try {
+    /** Returns the saved item, or null if it was already known or failed. */
+    suspend fun ingest(ctx: Context, dao: ItemDao, uri: Uri, source: String): Item? = try {
         val text = rec.process(InputImage.fromFilePath(ctx, uri)).await().text
-        if (text.isBlank()) false else {
-            val (type, detail) = Extractor.classify(text)
-            dao.insert(
-                Item(
-                    source = source, uri = uri.toString(), text = text,
-                    type = type, detail = detail, addedAt = System.currentTimeMillis()
-                )
-            ) > 0
-        }
+        val (type, detail) = Extractor.classify(text)
+        val item = Item(
+            source = source, uri = uri.toString(), text = text,
+            type = type, detail = detail, folder = type,
+            addedAt = System.currentTimeMillis()
+        )
+        if (dao.insert(item) > 0) item else null
     } catch (e: Exception) {
-        false
+        null
     }
 
-    suspend fun scanScreenshots(ctx: Context, dao: ItemDao, limit: Int = 100): Int {
+    suspend fun scanScreenshots(ctx: Context, dao: ItemDao, limit: Int = 100): List<Item> {
         val known = dao.sources().toHashSet()
         val fresh = mutableListOf<Uri>()
         val base = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
@@ -44,8 +43,8 @@ object Scanner {
                 if (u.toString() !in known) fresh.add(u)
             }
         }
-        var added = 0
-        for (u in fresh) if (ingest(ctx, dao, u, u.toString())) added++
+        val added = mutableListOf<Item>()
+        for (u in fresh) Scanner.ingest(ctx, dao, u, u.toString())?.let { added.add(it) }
         return added
     }
 }

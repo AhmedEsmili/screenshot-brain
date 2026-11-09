@@ -22,11 +22,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -55,6 +57,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import coil.compose.AsyncImage
+import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -63,6 +66,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val dao = AppDb.get(this).dao()
+        lifecycleScope.launch(Dispatchers.IO) { Reclassify.runOnce(this@MainActivity, dao) }
         handleShare(intent, dao)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
@@ -90,7 +94,8 @@ class MainActivity : ComponentActivity() {
                 dao.insert(
                     Item(
                         source = "text:" + txt.hashCode(), uri = null, text = txt,
-                        type = type, detail = detail, addedAt = System.currentTimeMillis()
+                        type = type, detail = detail, folder = type,
+                        addedAt = System.currentTimeMillis()
                     )
                 )
             }
@@ -98,20 +103,21 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private fun typeColor(t: String) = when (t) {
-    "Code" -> Color(0xFF7E57C2)
-    "Package" -> Color(0xFF8D6E63)
-    "Flight" -> Color(0xFF29B6F6)
-    "Receipt" -> Color(0xFF43A047)
-    "Event" -> Color(0xFFFB8C00)
-    "Address" -> Color(0xFFE53935)
-    "Wi-Fi" -> Color(0xFF00897B)
-    else -> Color(0xFF607D8B)
+private val palette = listOf(0xFF5C6BC0, 0xFF26A69A, 0xFFEF6C00, 0xFFAD1457, 0xFF2E7D32, 0xFF6A1B9A).map { Color(it) }
+
+private fun folderColor(n: String): Color {
+    if (n == Cats.ALL) return Color(0xFF455A64)
+    val c = Cats.find(n)
+    return if (c != null) Color(c.color) else palette[abs(n.hashCode()) % palette.size]
 }
+
+private fun folderEmoji(n: String) = if (n == Cats.ALL) "📚" else Cats.find(n)?.emoji ?: "📁"
+private fun folderName(n: String) = if (n == Cats.ALL) "All" else n
 
 private fun actionLabel(t: String) = when (t) {
     "Address" -> "Open in Maps"
     "Event", "Flight" -> "Add to calendar"
+    "Link" -> "Open link"
     else -> "Copy"
 }
 
@@ -127,9 +133,18 @@ fun Screen(dao: ItemDao) {
     var status by remember { mutableStateOf("") }
     var selected by remember { mutableStateOf(setOf<Long>()) }
     var viewing by remember { mutableStateOf<Int?>(null) }
+    var folder by remember { mutableStateOf<String?>(null) }
     var confirm by remember { mutableStateOf<List<Long>?>(null) }
     var pending by remember { mutableStateOf<List<Long>>(emptyList()) }
-    val list by remember(q) { dao.search(q.trim()) }.collectAsState(initial = emptyList())
+    var moveIds by remember { mutableStateOf<List<Long>?>(null) }
+    var nameDialog by remember { mutableStateOf<List<Long>?>(null) }
+    var nameText by remember { mutableStateOf("") }
+    var confirmFolder by remember { mutableStateOf(false) }
+
+    val results by remember(q) { dao.search(q.trim()) }.collectAsState(initial = emptyList())
+    val customFolders by remember { dao.customFolders() }.collectAsState(initial = emptyList())
+    val customNames = customFolders.map { it.name }.toSet()
+    val list = if (folder == null || folder == Cats.ALL) results else results.filter { it.folder == folder }
 
     val perm = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES
     else Manifest.permission.READ_EXTERNAL_STORAGE
@@ -137,14 +152,24 @@ fun Screen(dao: ItemDao) {
     fun scan() {
         scope.launch {
             busy = true
-            val n = withContext(Dispatchers.IO) { Scanner.scanScreenshots(ctx, dao) }
+            val n = withContext(Dispatchers.IO) { Scanner.scanScreenshots(ctx, dao).size }
             status = if (n > 0) "Added $n new" else ""
             busy = false
         }
     }
 
+    val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    fun onMediaGranted() {
+        scan()
+        Watcher.start(ctx)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
-        if (it) scan() else status = "Photo permission needed"
+        if (it) onMediaGranted() else status = "Photo permission needed"
     }
 
     val deleteLauncher = rememberLauncherForActivityResult(
@@ -181,20 +206,57 @@ fun Screen(dao: ItemDao) {
         }
     }
 
+    fun moveTo(ids: List<Long>, name: String) {
+        scope.launch(Dispatchers.IO) { dao.move(ids, name) }
+        selected = setOf(); viewing = null
+        status = "Moved to $name"
+    }
+
+    fun createFolder(name: String, ids: List<Long>) {
+        scope.launch(Dispatchers.IO) {
+            dao.addFolder(Folder(name, System.currentTimeMillis()))
+            if (ids.isNotEmpty()) dao.move(ids, name)
+        }
+        if (ids.isNotEmpty()) {
+            selected = setOf(); viewing = null
+            status = "Moved to $name"
+        }
+    }
+
     LaunchedEffect(Unit) {
-        if (ContextCompat.checkSelfPermission(ctx, perm) == PackageManager.PERMISSION_GRANTED) scan()
+        if (ContextCompat.checkSelfPermission(ctx, perm) == PackageManager.PERMISSION_GRANTED) onMediaGranted()
         else permLauncher.launch(perm)
     }
 
+    BackHandler(enabled = folder != null) { folder = null }
     BackHandler(enabled = selected.isNotEmpty()) { selected = setOf() }
+
+    LaunchedEffect(list.size, folder, q) {
+        val f = folder
+        if (f != null && f != Cats.ALL && list.isEmpty() && q.isBlank() && f !in customNames) folder = null
+    }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().statusBarsPadding().padding(horizontal = 12.dp)) {
+            val f = folder
             if (selected.isNotEmpty()) {
                 Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = { selected = setOf() }) { Icon(Icons.Default.Close, "Cancel") }
                     Text("${selected.size} selected", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                    TextButton(onClick = { moveIds = selected.toList() }) { Text("Move") }
                     IconButton(onClick = { confirm = selected.toList() }) { Icon(Icons.Default.Delete, "Delete") }
+                }
+            } else if (f != null) {
+                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { folder = null }) { Icon(Icons.Default.ArrowBack, "Back") }
+                    Text(
+                        folderEmoji(f) + "  " + folderName(f) + "  ·  " + list.size,
+                        style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (f in customNames) {
+                        IconButton(onClick = { confirmFolder = true }) { Icon(Icons.Default.Delete, "Delete folder") }
+                    }
                 }
             } else {
                 Text(
@@ -205,7 +267,7 @@ fun Screen(dao: ItemDao) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
                     value = q, onValueChange = { q = it }, singleLine = true,
-                    placeholder = { Text("Search: flight, receipt, wifi...") },
+                    placeholder = { Text(if (f == null) "Search everything..." else "Search in " + folderName(f)) },
                     shape = RoundedCornerShape(28.dp), modifier = Modifier.weight(1f)
                 )
                 IconButton(onClick = { scan() }, enabled = !busy) { Icon(Icons.Default.Refresh, "Scan") }
@@ -219,22 +281,53 @@ fun Screen(dao: ItemDao) {
                 )
             }
             Spacer(Modifier.height(8.dp))
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(2),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(bottom = 16.dp)
-            ) {
-                itemsIndexed(list, key = { _, x -> x.id }) { idx, item ->
-                    Tile(
-                        item = item,
-                        selected = item.id in selected,
-                        onClick = {
-                            if (selected.isNotEmpty()) selected = toggle(selected, item.id)
-                            else viewing = idx
-                        },
-                        onLong = { selected = toggle(selected, item.id) }
+
+            if (f == null && q.isBlank()) {
+                val counts = results.groupBy { it.folder }
+                val names = (counts.keys + customNames).distinct()
+                    .sortedWith(compareByDescending<String> { counts[it]?.size ?: 0 }.thenBy { it })
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(2),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    contentPadding = PaddingValues(bottom = 16.dp)
+                ) {
+                    if (results.isNotEmpty()) {
+                        item(key = "folder:all") {
+                            FolderTile(Cats.ALL, results.size, results.firstOrNull { it.uri != null }?.uri) { folder = Cats.ALL }
+                        }
+                    }
+                    items(names, key = { n -> "folder:$n" }) { n ->
+                        FolderTile(n, counts[n]?.size ?: 0, counts[n]?.firstOrNull { it.uri != null }?.uri) { folder = n }
+                    }
+                    item(key = "folder:new") {
+                        NewFolderTile { nameText = ""; nameDialog = emptyList() }
+                    }
+                }
+            } else {
+                if (list.isEmpty()) {
+                    Text(
+                        "Nothing here yet.", modifier = Modifier.padding(24.dp),
+                        style = MaterialTheme.typography.bodyMedium
                     )
+                }
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(2),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    contentPadding = PaddingValues(bottom = 16.dp)
+                ) {
+                    itemsIndexed(list, key = { _, x -> x.id }) { idx, item ->
+                        Tile(
+                            item = item,
+                            selected = item.id in selected,
+                            onClick = {
+                                if (selected.isNotEmpty()) selected = toggle(selected, item.id)
+                                else viewing = idx
+                            },
+                            onLong = { selected = toggle(selected, item.id) }
+                        )
+                    }
                 }
             }
         }
@@ -243,7 +336,8 @@ fun Screen(dao: ItemDao) {
             Viewer(
                 list = list, start = start,
                 onClose = { viewing = null },
-                onDelete = { id -> confirm = listOf(id) }
+                onDelete = { id -> confirm = listOf(id) },
+                onMove = { id -> moveIds = listOf(id) }
             )
         }
 
@@ -260,6 +354,106 @@ fun Screen(dao: ItemDao) {
                 },
                 confirmButton = { TextButton(onClick = { confirm = null }) { Text("Cancel") } }
             )
+        }
+
+        moveIds?.let { ids ->
+            val options = (customNames.toList().sorted() + Cats.list.map { it.name }).distinct()
+            AlertDialog(
+                onDismissRequest = { moveIds = null },
+                title = { Text("Move to folder") },
+                text = {
+                    Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState())) {
+                        TextButton(onClick = { moveIds = null; nameText = ""; nameDialog = ids }) { Text("➕  New folder...") }
+                        options.forEach { n ->
+                            TextButton(onClick = { moveIds = null; moveTo(ids, n) }) {
+                                Text(folderEmoji(n) + "  " + n)
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { moveIds = null }) { Text("Cancel") } }
+            )
+        }
+
+        nameDialog?.let { ids ->
+            AlertDialog(
+                onDismissRequest = { nameDialog = null },
+                title = { Text("New folder") },
+                text = {
+                    OutlinedTextField(
+                        value = nameText, onValueChange = { nameText = it.take(30) },
+                        singleLine = true, placeholder = { Text("e.g. Trip to Rome") }
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        enabled = nameText.isNotBlank() && nameText.trim() != Cats.ALL,
+                        onClick = { val n = nameText.trim(); nameDialog = null; createFolder(n, ids) }
+                    ) { Text("Create") }
+                },
+                dismissButton = { TextButton(onClick = { nameDialog = null }) { Text("Cancel") } }
+            )
+        }
+
+        if (confirmFolder) {
+            val n = folder ?: ""
+            AlertDialog(
+                onDismissRequest = { confirmFolder = false },
+                title = { Text("Delete folder \"$n\"?") },
+                text = { Text("Screenshots inside go back to their categories. Nothing is deleted from your phone.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        confirmFolder = false
+                        folder = null
+                        scope.launch(Dispatchers.IO) { dao.releaseFolder(n); dao.removeFolder(n) }
+                    }) { Text("Delete folder") }
+                },
+                dismissButton = { TextButton(onClick = { confirmFolder = false }) { Text("Cancel") } }
+            )
+        }
+    }
+}
+
+@Composable
+fun FolderTile(name: String, count: Int, preview: String?, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(20.dp)
+    Box(
+        Modifier.fillMaxWidth().aspectRatio(1.05f).clip(shape)
+            .background(folderColor(name)).clickable(onClick = onClick)
+    ) {
+        if (preview != null) {
+            AsyncImage(
+                model = preview, contentDescription = null, contentScale = ContentScale.Crop,
+                alpha = 0.35f, modifier = Modifier.fillMaxSize()
+            )
+        }
+        Column(Modifier.align(Alignment.BottomStart).padding(14.dp)) {
+            Text(folderEmoji(name), style = MaterialTheme.typography.headlineLarge)
+            Text(
+                folderName(name), color = Color.White, fontWeight = FontWeight.Bold,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.titleMedium
+            )
+            Text(
+                if (count == 1) "1 item" else "$count items", color = Color(0xCCFFFFFF),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+    }
+}
+
+@Composable
+fun NewFolderTile(onClick: () -> Unit) {
+    val shape = RoundedCornerShape(20.dp)
+    Box(
+        Modifier.fillMaxWidth().aspectRatio(1.05f).clip(shape)
+            .border(2.dp, MaterialTheme.colorScheme.outline, shape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("＋", style = MaterialTheme.typography.headlineLarge, color = MaterialTheme.colorScheme.primary)
+            Text("New folder", color = MaterialTheme.colorScheme.primary)
         }
     }
 }
@@ -283,7 +477,7 @@ fun Tile(item: Item, selected: Boolean, onClick: () -> Unit, onLong: () -> Unit)
             Text(item.text.take(160), Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
         }
         Surface(
-            shape = RoundedCornerShape(50), color = typeColor(item.type),
+            shape = RoundedCornerShape(50), color = folderColor(item.type),
             modifier = Modifier.align(Alignment.TopStart).padding(8.dp)
         ) {
             Text(
@@ -291,7 +485,7 @@ fun Tile(item: Item, selected: Boolean, onClick: () -> Unit, onLong: () -> Unit)
                 fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
             )
         }
-        if (item.detail.isNotBlank()) {
+        if (item.detail.isNotBlank() && item.type != "Code") {
             Box(
                 Modifier.align(Alignment.BottomStart).fillMaxWidth()
                     .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC000000))))
@@ -314,7 +508,10 @@ fun Tile(item: Item, selected: Boolean, onClick: () -> Unit, onLong: () -> Unit)
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun Viewer(list: List<Item>, start: Int, onClose: () -> Unit, onDelete: (Long) -> Unit) {
+fun Viewer(
+    list: List<Item>, start: Int,
+    onClose: () -> Unit, onDelete: (Long) -> Unit, onMove: (Long) -> Unit
+) {
     val ctx = LocalContext.current
     BackHandler(onBack = onClose)
     if (list.isEmpty()) {
@@ -361,11 +558,19 @@ fun Viewer(list: List<Item>, start: Int, onClose: () -> Unit, onDelete: (Long) -
                 .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC000000))))
                 .navigationBarsPadding().padding(16.dp)
         ) {
-            Surface(shape = RoundedCornerShape(50), color = typeColor(cur.type)) {
-                Text(
-                    cur.type, color = Color.White, style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
-                )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(shape = RoundedCornerShape(50), color = folderColor(cur.type)) {
+                    Text(
+                        cur.type, color = Color.White, style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
+                    )
+                }
+                if (cur.folder != cur.type && cur.folder.isNotBlank()) {
+                    Text(
+                        "  in " + folderEmoji(cur.folder) + " " + cur.folder, color = Color(0xCCFFFFFF),
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
             }
             if (cur.detail.isNotBlank()) {
                 Text(
@@ -375,7 +580,7 @@ fun Viewer(list: List<Item>, start: Int, onClose: () -> Unit, onDelete: (Long) -
             }
             Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Button(onClick = { act(ctx, cur) }) { Text(actionLabel(cur.type)) }
-                Spacer(Modifier.width(8.dp))
+                TextButton(onClick = { onMove(cur.id) }) { Text("Move", color = Color.White) }
                 TextButton(onClick = { copy(ctx, cur.text) }) { Text("Copy text", color = Color.White) }
             }
         }
@@ -398,6 +603,10 @@ fun act(ctx: Context, item: Item) {
                 Intent(Intent.ACTION_INSERT).setData(CalendarContract.Events.CONTENT_URI)
                     .putExtra(CalendarContract.Events.TITLE, item.type + ": " + item.detail)
             )
+            "Link" -> {
+                val u = item.detail.let { if (it.startsWith("http")) it else "https://$it" }
+                ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)))
+            }
             else -> copy(ctx, item.detail.ifBlank { item.text })
         }
     } catch (e: Exception) {

@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -16,7 +18,13 @@ jobs:
         with:
           gradle-version: 8.9
       - run: gradle assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
-        with:
-          name: screenshot-brain-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+      - run: cp app/build/outputs/apk/debug/app-debug.apk ScreenshotBrain.apk
+      - name: Publish stable download link
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --cleanup-tag -y || true
+          gh release create latest ScreenshotBrain.apk \
+            --target "${{ github.sha }}" \
+            --title "Latest build #${{ github.run_number }}" \
+            --notes "Build #${{ github.run_number }}"
