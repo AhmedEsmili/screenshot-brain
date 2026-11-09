@@ -12,13 +12,14 @@ data class Item(
     val text: String,
     val type: String,
     val detail: String,
-    val addedAt: Long
+    val addedAt: Long,
+    val hidden: Boolean = false
 )
 
 @Dao
 interface ItemDao {
     @Query(
-        "SELECT * FROM items WHERE (:q = '' OR text LIKE '%' || :q || '%' " +
+        "SELECT * FROM items WHERE hidden = 0 AND (:q = '' OR text LIKE '%' || :q || '%' " +
             "OR type LIKE '%' || :q || '%' OR detail LIKE '%' || :q || '%') " +
             "ORDER BY addedAt DESC"
     )
@@ -29,9 +30,17 @@ interface ItemDao {
 
     @Query("SELECT source FROM items")
     suspend fun sources(): List<String>
+
+    /** Soft delete: keeps the row so the scanner doesn't re-import the same screenshot. */
+    @Query("UPDATE items SET hidden = 1 WHERE id IN (:ids)")
+    suspend fun hide(ids: List<Long>)
+
+    /** Hard delete: used when the image file itself was deleted from the phone. */
+    @Query("DELETE FROM items WHERE id IN (:ids)")
+    suspend fun deleteByIds(ids: List<Long>)
 }
 
-@Database(entities = [Item::class], version = 1, exportSchema = false)
+@Database(entities = [Item::class], version = 2, exportSchema = false)
 abstract class AppDb : RoomDatabase() {
     abstract fun dao(): ItemDao
 
@@ -39,6 +48,7 @@ abstract class AppDb : RoomDatabase() {
         @Volatile private var inst: AppDb? = null
         fun get(c: Context): AppDb = inst ?: synchronized(this) {
             inst ?: Room.databaseBuilder(c.applicationContext, AppDb::class.java, "sb.db")
+                .fallbackToDestructiveMigration()
                 .build().also { inst = it }
         }
     }
