@@ -86,7 +86,7 @@ object Capture {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val n = Notification.Builder(ctx, "capture")
-            .setSmallIcon(android.R.drawable.ic_menu_gallery)
+            .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle(title).setContentText(text)
             .setAutoCancel(true).setContentIntent(pi).build()
         val ok = Build.VERSION.SDK_INT < 33 ||

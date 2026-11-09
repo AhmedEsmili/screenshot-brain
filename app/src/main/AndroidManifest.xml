@@ -7,8 +7,10 @@
 
     <application
         android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:label="Screenshot Brain"
-        android:theme="@android:style/Theme.Material.NoActionBar">
+        android:theme="@style/Theme.Sb">
         <activity
             android:name=".MainActivity"
             android:exported="true"
